@@ -409,23 +409,36 @@ def dataframe_to_rows(df):
     return rows
 
 
-def generate_excel(rows, edits, sheet_name="Sheet1"):
-    """Generate an Excel file from rows, highlighting edited cells in blue."""
+def generate_excel_all_sheets(sheet_data_dict, original_file_bytes, all_sheet_names):
+    """Generate an Excel file with all sheets, applying edits and highlighting edited cells."""
     wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = sheet_name
-    # Header row
-    for i, col_letter in enumerate(COL_LETTERS):
-        ws.cell(row=1, column=i + 1, value=COLUMNS[col_letter])
-    # Data rows
+    # Remove the default sheet
+    wb.remove(wb.active)
     edit_fill = PatternFill(start_color="DBEAFE", end_color="DBEAFE", fill_type="solid")
-    for row_i, row in enumerate(rows):
-        for col_i, col_letter in enumerate(COL_LETTERS):
-            idx = col_index(col_letter)
-            val = row[idx] if idx < len(row) else ""
-            cell = ws.cell(row=row_i + 2, column=col_i + 1, value=val)
-            if (row_i, col_letter) in edits:
-                cell.fill = edit_fill
+
+    for sname in all_sheet_names:
+        ws = wb.create_sheet(title=sname)
+        # Header row
+        for i, col_letter in enumerate(COL_LETTERS):
+            ws.cell(row=1, column=i + 1, value=COLUMNS[col_letter])
+
+        if sname in sheet_data_dict:
+            sdata = sheet_data_dict[sname]
+            rows = sdata.get("rows", [])
+            edits = sdata.get("edits", set())
+        else:
+            # Sheet not yet validated — read original data
+            rows = read_excel_rows(original_file_bytes, sheet_name=sname)
+            edits = set()
+
+        for row_i, row in enumerate(rows):
+            for col_i, col_letter in enumerate(COL_LETTERS):
+                idx = col_index(col_letter)
+                val = row[idx] if idx < len(row) else ""
+                cell = ws.cell(row=row_i + 2, column=col_i + 1, value=val)
+                if (row_i, col_letter) in edits:
+                    cell.fill = edit_fill
+
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
@@ -517,7 +530,38 @@ st.markdown(f"<small style='color:#888'>{len(checked_cols)} of {len(COL_LETTERS)
 
 run_btn = st.button("▶  Run Validation")
 
-if not run_btn and "last_results" not in st.session_state:
+# ─── PER-SHEET STATE ───
+if "sheet_data" not in st.session_state:
+    st.session_state.sheet_data = {}
+if "file_bytes" not in st.session_state:
+    st.session_state.file_bytes = None
+
+# Store file bytes for download across sheets
+st.session_state.file_bytes = file_bytes
+
+# Show progress for multi-sheet workbooks
+if len(sheet_names) > 1:
+    fixed_sheets = [s for s in sheet_names if s in st.session_state.sheet_data]
+    if fixed_sheets:
+        progress_tags = ""
+        for s in sheet_names:
+            if s in st.session_state.sheet_data:
+                sdata = st.session_state.sheet_data[s]
+                edit_count = len(sdata.get("edits", set()))
+                if edit_count > 0:
+                    progress_tags += f'<span style="background:#1a3a2a;color:#4ade80;padding:0.15rem 0.5rem;border-radius:4px;font-size:0.75rem;margin-right:0.4rem;">{s} ({edit_count} edits)</span>'
+                else:
+                    progress_tags += f'<span style="background:#1a2a3a;color:#60a5fa;padding:0.15rem 0.5rem;border-radius:4px;font-size:0.75rem;margin-right:0.4rem;">{s} (validated)</span>'
+            elif s == selected_sheet:
+                progress_tags += f'<span style="background:#3a3a1a;color:#f1c40f;padding:0.15rem 0.5rem;border-radius:4px;font-size:0.75rem;margin-right:0.4rem;">{s} (current)</span>'
+            else:
+                progress_tags += f'<span style="background:#1a1a22;color:#666;padding:0.15rem 0.5rem;border-radius:4px;font-size:0.75rem;margin-right:0.4rem;">{s}</span>'
+        st.markdown(f'<div style="margin:0.5rem 0;">{progress_tags}</div>', unsafe_allow_html=True)
+
+# Check if we have data for the current sheet
+has_sheet_data = selected_sheet in st.session_state.sheet_data
+
+if not run_btn and not has_sheet_data:
     st.stop()
 
 # ─── READ + VALIDATE ───
@@ -528,13 +572,16 @@ if run_btn:
         st.error(f"Could not read Excel file: {e}")
         st.stop()
     results = run_validation(rows, checked_cols)
-    st.session_state.last_results = results
-    st.session_state.last_rows = rows
-    st.session_state.last_checked = checked_cols
-    st.session_state.edits = set()
+    st.session_state.sheet_data[selected_sheet] = {
+        "results": results,
+        "rows": rows,
+        "checked": checked_cols,
+        "edits": st.session_state.sheet_data.get(selected_sheet, {}).get("edits", set()),
+    }
 
-results = st.session_state.last_results
-checked_cols = st.session_state.last_checked
+current_sheet_data = st.session_state.sheet_data[selected_sheet]
+results = current_sheet_data["results"]
+checked_cols = current_sheet_data["checked"]
 
 # ─── SUMMARY DASHBOARD ───
 total_rows = len(results)
@@ -574,9 +621,7 @@ if total_errors > 0:
     st.bar_chart(df_chart.set_index("Column"), color="#e74c3c", height=250)
 
 # ─── TRACK EDITS ───
-if "edits" not in st.session_state:
-    st.session_state.edits = set()
-edits = st.session_state.edits
+edits = current_sheet_data.get("edits", set())
 
 # ─── COLOR-CODED TABLE ───
 st.markdown('<div class="section-header">Data Table</div>', unsafe_allow_html=True)
@@ -654,7 +699,7 @@ if error_rows:
                 )
 
 # ─── EDIT & FIX ───
-current_rows = st.session_state.last_rows
+current_rows = current_sheet_data["rows"]
 col_display = {c: f"{c} - {COLUMNS[c]}" for c in COL_LETTERS}
 
 if not error_rows:
@@ -765,29 +810,53 @@ else:
                     new_edits.add((orig_i, col_letter))
                     # Update the full dataset
                     original_df.at[orig_i, col_letter] = new_val
-        st.session_state.edits = new_edits
-
         # Convert full edited df back to rows
         new_rows = dataframe_to_rows(original_df)
-        st.session_state.last_rows = new_rows
 
         # Re-run validation
         new_results = run_validation(new_rows, checked_cols)
-        st.session_state.last_results = new_results
-        st.session_state.last_checked = checked_cols
+
+        # Save back to per-sheet state
+        st.session_state.sheet_data[selected_sheet] = {
+            "results": new_results,
+            "rows": new_rows,
+            "checked": checked_cols,
+            "edits": new_edits,
+        }
         st.rerun()
 
 # ─── DOWNLOAD ───
-if edits:
+st.markdown('<div class="section-header">Download</div>', unsafe_allow_html=True)
+
+# Show edit summary across all sheets
+total_edits_all = 0
+edit_summary_parts = []
+for sname in sheet_names:
+    if sname in st.session_state.sheet_data:
+        sdata = st.session_state.sheet_data[sname]
+        s_edits = sdata.get("edits", set())
+        if s_edits:
+            total_edits_all += len(s_edits)
+            edit_summary_parts.append(f"<b>{sname}</b>: {len(s_edits)} cell(s)")
+
+if edit_summary_parts:
     st.markdown(
-        f"<small style='color:#60a5fa'>✏️ {len(edits)} cell(s) edited across "
-        f"{len(set(r for r, _ in edits))} row(s)</small>",
+        f"<small style='color:#60a5fa'>✏️ Total edits — {' | '.join(edit_summary_parts)}</small>",
         unsafe_allow_html=True,
     )
 
-st.markdown('<div class="section-header">Download</div>', unsafe_allow_html=True)
-download_rows = st.session_state.last_rows
-excel_buf = generate_excel(download_rows, edits, sheet_name=selected_sheet or "Sheet1")
+if len(sheet_names) > 1:
+    st.markdown(
+        "<small style='color:#888'>Download includes <b>all sheets</b> — "
+        "edited sheets use your fixes, unedited sheets keep original data.</small>",
+        unsafe_allow_html=True,
+    )
+
+excel_buf = generate_excel_all_sheets(
+    st.session_state.sheet_data,
+    st.session_state.file_bytes,
+    sheet_names,
+)
 st.download_button(
     label="📥  Download Corrected Excel",
     data=excel_buf,
