@@ -2,8 +2,10 @@ import streamlit as st
 import pandas as pd
 import openpyxl
 from openpyxl.utils.datetime import from_excel
+from openpyxl.styles import PatternFill
 import io
 from datetime import datetime, date
+import copy
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
@@ -168,6 +170,20 @@ section[data-testid="stSidebar"] .stFileUploader label {
 .cell-ok  { background: #0d2818; color: #4ade80; }
 .cell-err { background: #2d1215; color: #f87171; font-weight: 600; }
 .cell-skip { background: #1a1a22; color: #666; }
+.cell-edited { background: #1a2a3a; color: #60a5fa; border-left: 3px solid #3b82f6; }
+.cell-edited-ok { background: #0d2830; color: #38bdf8; border-left: 3px solid #3b82f6; }
+
+/* Edit badge */
+.edit-badge {
+    display: inline-block;
+    background: #3b82f6;
+    color: white;
+    border-radius: 999px;
+    padding: 0.1rem 0.5rem;
+    font-size: 0.68rem;
+    font-family: 'IBM Plex Mono', monospace;
+    margin-left: 0.3rem;
+}
 
 /* Run button */
 div[data-testid="stButton"] > button {
@@ -368,6 +384,54 @@ def read_excel_rows(file_bytes, sheet_name=None):
     return rows
 
 
+def rows_to_dataframe(rows):
+    """Convert raw row tuples to a DataFrame with column letter headers."""
+    data = []
+    for row in rows:
+        row_dict = {}
+        for col_letter in COL_LETTERS:
+            idx = col_index(col_letter)
+            raw = row[idx] if idx < len(row) else None
+            val = str(raw).strip() if raw is not None else ""
+            row_dict[col_letter] = val
+        data.append(row_dict)
+    return pd.DataFrame(data)
+
+
+def dataframe_to_rows(df):
+    """Convert edited DataFrame back to list of tuples."""
+    rows = []
+    for _, row in df.iterrows():
+        vals = []
+        for col_letter in COL_LETTERS:
+            vals.append(row.get(col_letter, ""))
+        rows.append(tuple(vals))
+    return rows
+
+
+def generate_excel(rows, edits, sheet_name="Sheet1"):
+    """Generate an Excel file from rows, highlighting edited cells in blue."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = sheet_name
+    # Header row
+    for i, col_letter in enumerate(COL_LETTERS):
+        ws.cell(row=1, column=i + 1, value=COLUMNS[col_letter])
+    # Data rows
+    edit_fill = PatternFill(start_color="DBEAFE", end_color="DBEAFE", fill_type="solid")
+    for row_i, row in enumerate(rows):
+        for col_i, col_letter in enumerate(COL_LETTERS):
+            idx = col_index(col_letter)
+            val = row[idx] if idx < len(row) else ""
+            cell = ws.cell(row=row_i + 2, column=col_i + 1, value=val)
+            if (row_i, col_letter) in edits:
+                cell.fill = edit_fill
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
 def run_validation(rows, checked_cols):
     results = []
     for row_i, row in enumerate(rows):
@@ -467,6 +531,7 @@ if run_btn:
     st.session_state.last_results = results
     st.session_state.last_rows = rows
     st.session_state.last_checked = checked_cols
+    st.session_state.edits = set()
 
 results = st.session_state.last_results
 checked_cols = st.session_state.last_checked
@@ -508,6 +573,11 @@ if total_errors > 0:
     st.markdown('<div class="section-header">Errors by Column</div>', unsafe_allow_html=True)
     st.bar_chart(df_chart.set_index("Column"), color="#e74c3c", height=250)
 
+# ─── TRACK EDITS ───
+if "edits" not in st.session_state:
+    st.session_state.edits = set()
+edits = st.session_state.edits
+
 # ─── COLOR-CODED TABLE ───
 st.markdown('<div class="section-header">Data Table</div>', unsafe_allow_html=True)
 
@@ -526,17 +596,28 @@ else:
     rows_html = ""
     for orig_i, row in display_results:
         err_count = row_error_counts[orig_i]
-        cells = f'<td><b>{orig_i + 1}</b>{"<span class=err-badge>" + str(err_count) + "</span>" if err_count else ""}</td>'
+        edited_count = sum(1 for c in COL_LETTERS if (orig_i, c) in edits)
+        badge = ""
+        if err_count:
+            badge += f'<span class="err-badge">{err_count}</span>'
+        if edited_count:
+            badge += f'<span class="edit-badge">{edited_count} edited</span>'
+        cells = f'<td><b>{orig_i + 1}</b>{badge}</td>'
         for c in COL_LETTERS:
             cell = row[c]
-            if cell["skipped"]:
+            is_edited = (orig_i, c) in edits
+            if is_edited and not cell.get("error"):
+                cls = "cell-edited-ok"
+            elif is_edited:
+                cls = "cell-edited"
+            elif cell["skipped"]:
                 cls = "cell-skip"
             elif cell["error"]:
                 cls = "cell-err"
             else:
                 cls = "cell-ok"
             val = cell["value"] if cell["value"] else "—"
-            title = cell["error"] or ""
+            title = cell["error"] or ("Edited" if is_edited else "")
             cells += f'<td class="{cls}" title="{title}">{val}</td>'
         rows_html += f"<tr>{cells}</tr>"
 
@@ -549,7 +630,11 @@ else:
     </div>
     """
     st.markdown(table_html, unsafe_allow_html=True)
-    st.markdown("<small style='color:#888'>💡 Hover over a red cell to see the error. Column letters match the template.</small>", unsafe_allow_html=True)
+    st.markdown(
+        "<small style='color:#888'>💡 Hover over a red cell to see the error. "
+        "Blue cells = edited. Column letters match the template.</small>",
+        unsafe_allow_html=True,
+    )
 
 # ─── ERROR DETAILS ───
 error_rows = [(i, r) for i, r in enumerate(results) if row_error_counts[i] > 0]
@@ -565,5 +650,147 @@ if error_rows:
                     f'<span class="err-col-tag">{col_letter}</span>'
                     f'<b>{COLUMNS[col_letter]}:</b> {err_msg}'
                     f'</div>',
-                    unsafe_allow_html=True
+                    unsafe_allow_html=True,
                 )
+
+# ─── EDIT & FIX ───
+current_rows = st.session_state.last_rows
+col_display = {c: f"{c} - {COLUMNS[c]}" for c in COL_LETTERS}
+
+if not error_rows:
+    st.markdown('<div class="section-header">Edit & Fix</div>', unsafe_allow_html=True)
+    st.success("🎉 No errors to fix!")
+else:
+    st.markdown('<div class="section-header">Edit & Fix</div>', unsafe_allow_html=True)
+    st.markdown(
+        f"<small style='color:#f87171'><b>{len(error_rows)}</b> row(s) with errors. "
+        f"Only error rows are shown below — fix the highlighted columns and click <b>Save & Re-validate</b>.</small>",
+        unsafe_allow_html=True,
+    )
+
+    # Show per-row error guide above the editor
+    for orig_i, row in error_rows:
+        err_cols = [c for c in checked_cols if row[c]["error"]]
+        err_tags = " ".join(
+            f'<span class="err-col-tag">{c}</span>' for c in err_cols
+        )
+        st.markdown(
+            f'<div style="margin:0.2rem 0;font-size:0.82rem;color:#f87171;">'
+            f'<b>Row {orig_i + 1}</b> → fix: {err_tags}</div>',
+            unsafe_allow_html=True,
+        )
+
+    # Build DataFrame with ONLY error rows
+    error_row_indices = [i for i, _ in error_rows]
+    df_full = rows_to_dataframe(current_rows)
+    df_errors = df_full.loc[error_row_indices].copy()
+
+    # Add a "Row #" column at the front for reference
+    df_errors.insert(0, "Row", [i + 1 for i in error_row_indices])
+
+    # Only show columns that have errors + the Row column
+    error_col_set = set()
+    for orig_i, row in error_rows:
+        for c in checked_cols:
+            if row[c]["error"]:
+                error_col_set.add(c)
+    # Always include columns with errors, plus show all so user has context
+    show_cols = ["Row"] + list(COL_LETTERS)
+    df_errors_display = df_errors[show_cols].copy()
+
+    # Rename data columns for clarity
+    rename_map = {c: col_display[c] for c in COL_LETTERS}
+    rename_map["Row"] = "Row #"
+    df_errors_display = df_errors_display.rename(columns=rename_map)
+
+    # Build column config
+    col_config = {
+        "Row #": st.column_config.NumberColumn("Row #", disabled=True, width="small"),
+    }
+    for col_letter in COL_LETTERS:
+        display_name = col_display[col_letter]
+        is_error_col = col_letter in error_col_set
+        if col_letter in DROPDOWNS:
+            col_config[display_name] = st.column_config.SelectboxColumn(
+                f"{'⚠ ' if is_error_col else ''}{display_name}",
+                options=DROPDOWNS[col_letter],
+                required=col_letter in REQUIRED,
+            )
+        elif col_letter == "E":
+            col_config[display_name] = st.column_config.NumberColumn(
+                f"{'⚠ ' if is_error_col else ''}{display_name}",
+                min_value=18, max_value=80, step=1,
+            )
+        elif col_letter == "W":
+            col_config[display_name] = st.column_config.NumberColumn(
+                f"{'⚠ ' if is_error_col else ''}{display_name}",
+                min_value=0, step=0.5,
+            )
+        else:
+            col_config[display_name] = st.column_config.TextColumn(
+                f"{'⚠ ' if is_error_col else ''}{display_name}",
+            )
+
+    # Highlight error columns — move them to front after Row #
+    error_col_order = [col_display[c] for c in COL_LETTERS if c in error_col_set]
+    non_error_col_order = [col_display[c] for c in COL_LETTERS if c not in error_col_set]
+    final_col_order = ["Row #"] + error_col_order + non_error_col_order
+    df_errors_display = df_errors_display[final_col_order]
+
+    edited_df = st.data_editor(
+        df_errors_display,
+        column_config=col_config,
+        use_container_width=True,
+        num_rows="fixed",
+        key="data_editor",
+        column_order=final_col_order,
+    )
+
+    # ─── SAVE & RE-VALIDATE ───
+    revalidate_btn = st.button("🔄  Save & Re-validate")
+
+    if revalidate_btn:
+        # Reverse column rename
+        reverse_rename = {v: k for k, v in rename_map.items()}
+        edited_df_raw = edited_df.rename(columns=reverse_rename)
+
+        # Map edits back to full dataset
+        original_df = rows_to_dataframe(current_rows)
+        new_edits = set(edits)
+        for df_idx, orig_i in enumerate(error_row_indices):
+            for col_letter in COL_LETTERS:
+                orig_val = str(original_df.at[orig_i, col_letter]).strip()
+                new_val = str(edited_df_raw.iloc[df_idx][col_letter]).strip()
+                if orig_val != new_val:
+                    new_edits.add((orig_i, col_letter))
+                    # Update the full dataset
+                    original_df.at[orig_i, col_letter] = new_val
+        st.session_state.edits = new_edits
+
+        # Convert full edited df back to rows
+        new_rows = dataframe_to_rows(original_df)
+        st.session_state.last_rows = new_rows
+
+        # Re-run validation
+        new_results = run_validation(new_rows, checked_cols)
+        st.session_state.last_results = new_results
+        st.session_state.last_checked = checked_cols
+        st.rerun()
+
+# ─── DOWNLOAD ───
+if edits:
+    st.markdown(
+        f"<small style='color:#60a5fa'>✏️ {len(edits)} cell(s) edited across "
+        f"{len(set(r for r, _ in edits))} row(s)</small>",
+        unsafe_allow_html=True,
+    )
+
+st.markdown('<div class="section-header">Download</div>', unsafe_allow_html=True)
+download_rows = st.session_state.last_rows
+excel_buf = generate_excel(download_rows, edits, sheet_name=selected_sheet or "Sheet1")
+st.download_button(
+    label="📥  Download Corrected Excel",
+    data=excel_buf,
+    file_name="corrected_academic_personnel.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.xml",
+)
